@@ -37,8 +37,11 @@ except ImportError:
 
 try:
     from pytest_pyodide import run_in_pyodide, copy_files_to_pyodide
+    from pathlib import Path
 
-    HAS_PYODIDE_TEST = True
+    HAS_PYODIDE_TEST = (
+        True and (Path(__file__).parent.parent.parent / "pyodide").exists()
+    )
 except ImportError:
     HAS_PYODIDE_TEST = False
 
