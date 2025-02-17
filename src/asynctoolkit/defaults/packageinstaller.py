@@ -1,6 +1,7 @@
 from typing import Optional
 import importlib
 import sys
+import asyncio
 
 from ..base import register_tool, ExtendableTool
 
@@ -27,7 +28,7 @@ class PackageInstallerTool(ExtendableTool[None]):
         )
 
         if upgrade:
-            # reload the top-level modules of the package
+            # Reload the top-level modules of the package.
             try:
                 dist = importlib.metadata.distribution(package_name)
                 top_level_modules = dist.read_text("top_level.txt").splitlines()
@@ -43,6 +44,7 @@ class PackageInstallerTool(ExtendableTool[None]):
         return res
 
 
+# Micropip Extension
 try:
     import micropip
 
@@ -51,8 +53,7 @@ try:
         version: Optional[str] = None,
         upgrade: bool = False,
     ):
-        # check if the package is already installed
-
+        # Check if the package is already installed.
         try:
             importlib.metadata.distribution(package_name)
             if upgrade:
@@ -71,6 +72,8 @@ try:
 except ImportError:
     pass
 
+
+# Pip Extension
 try:
     import pip
 
@@ -82,12 +85,14 @@ try:
         try:
             from pip._internal import main as pip_main
         except ImportError:
-            # Fallback for older versions of pip
+            # Fallback for older versions of pip.
             from pip import main as pip_main
 
         if version:
             package_name = f"{package_name}{version}"
-        pip_main(["install", package_name] + (["--upgrade"] if upgrade else []))
+        args = ["install", package_name] + (["--upgrade"] if upgrade else [])
+        # Run pip_main in a separate thread to avoid blocking the event loop.
+        await asyncio.to_thread(pip_main, args)
 
     PackageInstallerTool.register_extension("pip", pip_install)
 except ImportError:
