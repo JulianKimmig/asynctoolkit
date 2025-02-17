@@ -75,24 +75,29 @@ except ImportError:
 
 # Pip Extension
 try:
-    import pip
 
     async def pip_install(
         package_name: str,
         version: Optional[str] = None,
         upgrade: bool = False,
     ):
-        try:
-            from pip._internal import main as pip_main
-        except ImportError:
-            # Fallback for older versions of pip.
-            from pip import main as pip_main
-
         if version:
-            package_name = f"{package_name}{version}"
+            package_name = f'"{package_name}{version}"'
         args = ["install", package_name] + (["--upgrade"] if upgrade else [])
         # Run pip_main in a separate thread to avoid blocking the event loop.
-        await asyncio.to_thread(pip_main, args)
+        cmd = [sys.executable, "-m", "pip"] + args
+        print(
+            " ".join(cmd),
+        )
+        proc = await asyncio.create_subprocess_shell(
+            " ".join(cmd),
+            stderr=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+        )
+
+        stdout, stderr = await proc.communicate()
+        print(stdout.decode())
+        print(stderr.decode())
 
     PackageInstallerTool.register_extension("pip", pip_install)
 except ImportError:
