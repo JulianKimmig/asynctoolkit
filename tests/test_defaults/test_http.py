@@ -4,7 +4,8 @@ import asyncio
 # Import the run_tool function from your package.
 # Adjust the import paths if your package structure is different.
 from asynctoolkit.base import run_tool
-from asynctoolkit.defaults.http import HTTPTool
+from asynctoolkit.defaults.http import HTTPTool, AsyncResponse
+import json
 
 # Check for optional backend dependencies.
 try:
@@ -76,6 +77,60 @@ async def test_http_tool_extension(extension, available):
         assert data["url"].startswith(TEST_URL)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extension,available",
+    [
+        ("aiohttp", HAS_AIOHTTP),
+        ("requests", HAS_REQUESTS),
+        ("httpx", HAS_HTTPX),
+    ],
+)
+async def test_http_iter_content(extension, available):
+    if not available:
+        pytest.skip(f"Extension '{extension}' not installed.")
+    TEST_URL = "https://httpbin.org/get"
+    async with await run_tool(
+        "http",
+        url=TEST_URL,
+        method="GET",
+        extension=extension,
+        stream=True,
+    ) as response:
+        content = b""
+        async for chunk in response.iter_content(11):
+            assert len(chunk) <= 11
+            content += chunk
+
+        assert content
+        data = json.loads(content)
+        assert "url" in data
+        assert data["url"].startswith(TEST_URL)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "extension,available",
+    [
+        ("aiohttp", HAS_AIOHTTP),
+        ("requests", HAS_REQUESTS),
+        ("httpx", HAS_HTTPX),
+    ],
+)
+async def test_http_raise_for(extension, available):
+    if not available:
+        pytest.skip(f"Extension '{extension}' not installed.")
+    TEST_URL = "https://httpbin.org/status/404"
+    async with await run_tool(
+        "http",
+        url=TEST_URL,
+        method="GET",
+        extension=extension,
+    ) as response:
+        with pytest.raises(AsyncResponse.HTTPError):
+            await response.raise_for_status()
+
+
 if HAS_PYODIDE_TEST:
 
     @copy_files_to_pyodide(
@@ -102,6 +157,63 @@ if HAS_PYODIDE_TEST:
             assert status == 200
 
             data = await response.json()
+            assert "url" in data
+            assert data["url"].startswith(TEST_URL)
+
+    @copy_files_to_pyodide(
+        file_list=[("src/asynctoolkit", "asynctoolkit")],
+        install_wheels=True,
+        recurse_directories=True,
+    )
+    @run_in_pyodide
+    async def test_http_raise_for_pyodide(selenium):
+        import os
+
+        from asynctoolkit.base import run_tool
+        from asynctoolkit.defaults.http import HTTPTool, AsyncResponse
+
+        TEST_URL = "https://httpbin.org/status/404"
+
+        async with await run_tool(
+            "http",
+            url=TEST_URL,
+            method="GET",
+            extension="pyodide",
+        ) as response:
+            try:
+                await response.raise_for_status()
+                raise ValueError("Expected HTTPError")
+            except AsyncResponse.HTTPError:
+                pass
+
+    @copy_files_to_pyodide(
+        file_list=[("src/asynctoolkit", "asynctoolkit")],
+        install_wheels=True,
+        recurse_directories=True,
+    )
+    @run_in_pyodide
+    async def test_http_iter_content_pyodide(selenium):
+        import os
+        import json
+        from asynctoolkit.base import run_tool
+        from asynctoolkit.defaults.http import HTTPTool
+
+        TEST_URL = "https://httpbin.org/get"
+
+        async with await run_tool(
+            "http",
+            url=TEST_URL,
+            method="GET",
+            extension="pyodide",
+            stream=True,
+        ) as response:
+            content = b""
+            async for chunk in response.iter_content(11):
+                assert len(chunk) <= 11
+                content += chunk
+
+            assert content
+            data = json.loads(content)
             assert "url" in data
             assert data["url"].startswith(TEST_URL)
 
