@@ -70,7 +70,7 @@ async def test_http_tool_extension(extension, available):
         extension=extension,
     ) as response:
         status = await response.status()
-        assert status == 200
+        assert status == 200, f"Status is {status} with message {await response.reason()}"
 
         data = await response.json()
         assert "url" in data

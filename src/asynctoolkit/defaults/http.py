@@ -208,6 +208,10 @@ try:
 
         @asynccontextmanager
         async def _request_context():
+            try:
+                inner_timeout = aiohttp.ClientTimeout(connect=timeout,sock_read=timeout,sock_connect=timeout)
+            except Exception as e:
+                inner_timeout = timeout
             async with aiohttp.ClientSession() as session:
                 async with session.request(
                     method,
@@ -216,7 +220,7 @@ try:
                     params=params,
                     data=data,
                     json=json,
-                    timeout=timeout,
+                    timeout=inner_timeout,
                     **kwargs,
                 ) as response:
                     yield AiohttpResponse(response)
