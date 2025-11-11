@@ -72,7 +72,7 @@ try:  # pragma: no cover - only available in Pyodide
     if sys.platform == "emscripten":  # pragma: no cover - only available in Pyodide
         PackageInstallerTool.register_extension("micropip", micropip_install)
 except ImportError:  # pragma: no cover - optional dependency
-    pass
+    pass  # pragma: no cover - optional dependency
 
 
 # Pip Extension
@@ -102,8 +102,8 @@ try:
         print(stderr.decode())
 
     PackageInstallerTool.register_extension("pip", pip_install)
-except ImportError:
-    pass
+except ImportError:  # pragma: no cover - optional dependency
+    pass  # pragma: no cover - optional dependency
 
 
 register_tool("packageinstaller", PackageInstallerTool)
