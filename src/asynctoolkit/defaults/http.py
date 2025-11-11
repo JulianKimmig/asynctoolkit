@@ -1,7 +1,7 @@
 from __future__ import annotations
 from contextlib import asynccontextmanager, AbstractAsyncContextManager
 from typing import Any, Optional
-from collections.abc import AsyncIterable
+from collections.abc import AsyncIterable, Mapping
 from abc import ABC, abstractmethod
 from ..base import register_tool, ExtendableTool
 
@@ -37,40 +37,49 @@ class AsyncResponse(ABC):
         """
         Asynchronously return the response body as a string.
         """
-        pass
+        raise NotImplementedError("text() must be implemented by subclasses.")
 
     @abstractmethod
     async def json(self) -> Any:
         """
         Asynchronously return the JSON-decoded content of the response.
         """
-        pass
+        raise NotImplementedError("json() must be implemented by subclasses.")
 
     @abstractmethod
     async def status(self) -> int:
         """
         Asynchronously return the HTTP status code.
         """
-        pass
+        raise NotImplementedError("status() must be implemented by subclasses.")
 
     @abstractmethod
     async def headers(self) -> dict:
         """
         Asynchronously return the HTTP headers.
         """
-        pass
+        raise NotImplementedError("headers() must be implemented by subclasses.")
 
     @abstractmethod
     async def reason(self) -> str:
         """
         Asynchronously return the HTTP reason phrase.
         """
+        raise NotImplementedError("reason() must be implemented by subclasses.")
 
     @abstractmethod
     async def iter_content(self, chunk_size: int = 1024) -> AsyncIterable[bytes]:
         """
         Asynchronously return an iterator over the response content.
         """
+        raise NotImplementedError("iter_content() must be implemented by subclasses.")
+
+    @abstractmethod
+    async def content(self) -> bytes:
+        """
+        Asynchronously return the response content.
+        """
+        raise NotImplementedError("content() must be implemented by subclasses.")
 
     async def raise_for_status(self):
         """
@@ -80,7 +89,7 @@ class AsyncResponse(ABC):
         status_code = await self.status()
         reason = await self.reason()
         http_error_msg = ""
-        if isinstance(self.reason, bytes):
+        if isinstance(reason, bytes):
             # We attempt to decode utf-8 first because some servers
             # choose to localize their reason strings. If the string
             # isn't utf-8, we fall back to iso-8859-1 for all other
@@ -117,6 +126,8 @@ class HTTPTool(ExtendableTool[AbstractAsyncContextManager[AsyncResponse]]):
         timeout: int = 10,
         stream: bool = False,
         extension=None,
+        files: Optional[dict] = None,
+        cookies: Optional[dict] = None,
     ) -> AbstractAsyncContextManager[AsyncResponse]:
         """
         Execute an HTTP request using a registered backend extension.
@@ -129,7 +140,9 @@ class HTTPTool(ExtendableTool[AbstractAsyncContextManager[AsyncResponse]]):
             data: Optional request body data.
             json: Optional JSON data to send in the request body.
             timeout: Request timeout in seconds.
-
+            stream: Whether to stream the response.
+            extension: The extension to use for the HTTP request.
+            files: Optional files to send in the request body.
         Returns:
             The result of the HTTP request.
         """
@@ -139,16 +152,29 @@ class HTTPTool(ExtendableTool[AbstractAsyncContextManager[AsyncResponse]]):
                 "data and json parameters can not be used at the same time"
             )
 
+        request_kwargs: dict[str, Any] = {
+            "url": url,
+            "method": method,
+            "timeout": timeout,
+            "stream": stream,
+        }
+
+        if headers is not None:
+            request_kwargs["headers"] = headers
+        if params is not None:
+            request_kwargs["params"] = params
+        if data is not None:
+            request_kwargs["data"] = data
+        if json is not None:
+            request_kwargs["json"] = json
+        if files is not None:
+            request_kwargs["files"] = files
+        if cookies is not None:
+            request_kwargs["cookies"] = cookies
+
         return await super().run(
-            url=url,
-            method=method,
-            headers=headers,
-            params=params,
-            data=data,
-            json=json,
-            timeout=timeout,
-            stream=stream,
             extension=extension,
+            **request_kwargs,
         )
 
 
@@ -191,6 +217,9 @@ try:
             async for chunk in self.response.content.iter_chunked(chunk_size):
                 yield chunk
 
+        async def content(self) -> bytes:
+            return await self.response.read()
+
     async def _register_aiohttp_request(
         url: str,
         method: str = "GET",
@@ -200,26 +229,68 @@ try:
         json: Optional[Any] = None,
         timeout: int = 10,
         stream: bool = False,  # aiohttp does not need stream parameter
+        cookies: Optional[dict] = None,
+        files: Optional[dict] = None,
         **kwargs,
     ) -> AbstractAsyncContextManager[AsyncResponse]:
         """
         Perform an HTTP request using aiohttp.
         """
 
+        payload = data
+        if files:
+            if data is not None and not isinstance(data, Mapping):
+                raise TypeError(
+                    "When using files with the aiohttp backend, data must be a mapping."
+                )
+            form = aiohttp.FormData()
+            if isinstance(data, Mapping):
+                for key, value in data.items():
+                    form.add_field(key, value)
+            for field, file_value in files.items():
+                form_kwargs = {}
+                file_body = file_value
+                filename = None
+                content_type = None
+
+                if isinstance(file_value, (tuple, list)):
+                    if len(file_value) < 2 or len(file_value) > 3:
+                        raise ValueError(
+                            "Files for aiohttp must be (filename, fileobj[, content_type])."
+                        )
+                    filename, file_body, *extra = file_value
+                    if extra:
+                        content_type = extra[0]
+                elif hasattr(file_value, "name"):
+                    filename = getattr(file_value, "name")
+
+                if filename is not None:
+                    form_kwargs["filename"] = filename
+                if content_type is not None:
+                    form_kwargs["content_type"] = content_type
+
+                form.add_field(field, file_body, **form_kwargs)
+
+            payload = form
+
         @asynccontextmanager
         async def _request_context():
             try:
-                inner_timeout = aiohttp.ClientTimeout(connect=timeout,sock_read=timeout,sock_connect=timeout)
-            except Exception as e:
+                inner_timeout = aiohttp.ClientTimeout(
+                    connect=timeout, sock_read=timeout, sock_connect=timeout
+                )
+            except Exception:
                 inner_timeout = timeout
+
             async with aiohttp.ClientSession() as session:
                 async with session.request(
                     method,
                     url,
                     headers=headers,
                     params=params,
-                    data=data,
+                    data=payload,
                     json=json,
+                    cookies=cookies,
                     timeout=inner_timeout,
                     **kwargs,
                 ) as response:
@@ -228,7 +299,7 @@ try:
         return _request_context()
 
     HTTPTool.register_extension("aiohttp", _register_aiohttp_request)
-except ImportError:
+except ImportError:  # pragma: no cover - optional dependency
     pass
 
 ###############################################################################
@@ -266,8 +337,14 @@ try:
             return self.response.reason
 
         async def iter_content(self, chunk_size: int = 1024) -> AsyncIterable[bytes]:
-            for chunk in self.response.iter_content(chunk_size):
+            for chunk in self.response.iter_content(chunk_size=chunk_size):
                 yield chunk
+
+        async def content(self) -> bytes:
+            data = bytearray()
+            async for chunk in self.iter_content():
+                data.extend(chunk)
+            return bytes(data)
 
     async def _register_requests_request(
         url: str,
@@ -302,7 +379,7 @@ try:
         return _request_context()
 
     HTTPTool.register_extension("requests", _register_requests_request)
-except ImportError:
+except ImportError:  # pragma: no cover - optional dependency
     pass
 
 ###############################################################################
@@ -340,6 +417,9 @@ try:
             async for chunk in self.response.aiter_bytes(chunk_size):
                 yield chunk
 
+        async def content(self) -> bytes:
+            return await self.response.aread()
+
     async def _register_httpx_request(
         url: str,
         method: str = "GET",
@@ -348,7 +428,7 @@ try:
         data: Optional[Any] = None,
         json: Optional[Any] = None,
         timeout: int = 10,
-        stream: bool = False,  # httpx does not need stream parameter
+        stream: bool = False,
         **kwargs,
     ) -> AbstractAsyncContextManager[HttpxResponse]:
         """
@@ -357,28 +437,36 @@ try:
 
         @asynccontextmanager
         async def _request_context():
+            request_kwargs = dict(
+                headers=headers,
+                params=params,
+                data=data,
+                json=json,
+                **kwargs,
+            )
+
             async with httpx.AsyncClient(timeout=timeout) as client:
-                response = await client.request(
-                    method,
-                    url,
-                    headers=headers,
-                    params=params,
-                    data=data,
-                    json=json,
-                    **kwargs,
-                )
-                yield HttpxResponse(response)
+                if stream:
+                    async with client.stream(method, url, **request_kwargs) as response:
+                        yield HttpxResponse(response)
+                else:
+                    response = await client.request(
+                        method,
+                        url,
+                        **request_kwargs,
+                    )
+                    yield HttpxResponse(response)
 
         return _request_context()
 
     HTTPTool.register_extension("httpx", _register_httpx_request)
-except ImportError:
+except ImportError:  # pragma: no cover - optional dependency
     pass
 
 ###############################################################################
 # Pyodide fetch Implementation
 ###############################################################################
-try:
+try:  # pragma: no cover - requires Pyodide runtime
     # In Pyodide environments, pyodide.http provides pyfetch.
     from pyodide.http import pyfetch
     from urllib.parse import urlencode, urlsplit, urlunsplit
@@ -420,6 +508,11 @@ try:
             if b:
                 yield bytes(b)
 
+        async def content(self) -> bytes:
+            data = bytearray()
+            async for chunk in self.iter_content():
+                data.extend(chunk)
+            return bytes(data)
 
     async def _register_pyodide_request(
         url: str,
@@ -474,5 +567,5 @@ try:
         return _request_context()
 
     HTTPTool.register_extension("pyodide", _register_pyodide_request)
-except ImportError:
+except ImportError:  # pragma: no cover - requires Pyodide runtime
     pass
