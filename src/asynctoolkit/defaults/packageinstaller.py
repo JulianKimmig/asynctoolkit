@@ -12,6 +12,7 @@ class PackageInstallerTool(ExtendableTool[None]):
         package_name: str,
         version: Optional[str] = None,
         upgrade: bool = False,
+        extension=None,
     ):
         # If a specific version is requested, modify the command accordingly.
         if version:
@@ -25,6 +26,7 @@ class PackageInstallerTool(ExtendableTool[None]):
             package_name=package_name,
             version=version,
             upgrade=upgrade,
+            extension=extension,
         )
 
         if upgrade:
@@ -45,10 +47,10 @@ class PackageInstallerTool(ExtendableTool[None]):
 
 
 # Micropip Extension
-try:
+try:  # pragma: no cover - only available in Pyodide
     import micropip
 
-    async def micropip_install(
+    async def micropip_install(  # pragma: no cover - only available in Pyodide
         package_name: str,
         version: Optional[str] = None,
         upgrade: bool = False,
@@ -67,10 +69,10 @@ try:
             package_name = f"{package_name}{version}"
         await micropip.install(package_name)
 
-    if sys.platform == "emscripten":
+    if sys.platform == "emscripten":  # pragma: no cover - only available in Pyodide
         PackageInstallerTool.register_extension("micropip", micropip_install)
-except ImportError:
-    pass
+except ImportError:  # pragma: no cover - optional dependency
+    pass  # pragma: no cover - optional dependency
 
 
 # Pip Extension
@@ -100,8 +102,8 @@ try:
         print(stderr.decode())
 
     PackageInstallerTool.register_extension("pip", pip_install)
-except ImportError:
-    pass
+except ImportError:  # pragma: no cover - optional dependency
+    pass  # pragma: no cover - optional dependency
 
 
 register_tool("packageinstaller", PackageInstallerTool)
