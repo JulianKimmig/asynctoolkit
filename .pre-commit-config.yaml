@@ -6,6 +6,8 @@ repos:
         args: [--unsafe]
       - id: end-of-file-fixer
       - id: trailing-whitespace
+      - id: no-commit-to-branch
+        args: ["--branch", "main", "--branch", "master", "--branch", "test"]
 
   - repo: https://github.com/astral-sh/uv-pre-commit
     # uv version.
