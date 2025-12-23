@@ -46,7 +46,7 @@ class AsyncTool(ABC, Generic[R]):
         Returns:
             The result of the tool's operation.
         """
-        pass
+        raise NotImplementedError("AsyncTool subclasses must implement run().")
 
 
 class ExtendableTool(AsyncTool[R], Generic[R]):
@@ -143,7 +143,9 @@ class ExtendableTool(AsyncTool[R], Generic[R]):
             extension = [extension]
 
         errors = {}
-        for ext in extension:
+        extensions_to_try = extension
+        single_extension = len(extensions_to_try) == 1
+        for ext in extensions_to_try:
             ex = self.get_extension(ext)
             try:
                 return await ex(*args, **kwargs)
@@ -153,9 +155,12 @@ class ExtendableTool(AsyncTool[R], Generic[R]):
                 logger.exception(
                     f"Error running tool {self.__class__.__name__} with extension {ext}"
                 )
+                if single_extension:
+                    if isinstance(exc, (TypeError, ValueError)):
+                        raise
 
         raise ValueError(
-            f"Could not run tool {self.__class__.__name__} with extensions {extension} "
+            f"Could not run tool {self.__class__.__name__} with extensions {extensions_to_try} "
             f"and args {args} and kwargs {kwargs}.\nErrors: {errors}"
         )
 
