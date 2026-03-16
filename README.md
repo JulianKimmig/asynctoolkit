@@ -101,6 +101,11 @@ asyncio.run(run_my_tool())
 
 For tools that support multiple implementations (like the HTTP tool), you can register extensions. Each extension is simply an asynchronous function that conforms to the tool’s expected interface. See the built-in HTTP tool in `asynctoolkit.defaults.http` for examples using `aiohttp`, `httpx`, `requests`, and `pyodide`.
 
+`HTTPTool.run(...)` also exposes backend-neutral TLS verification via `verify=`.
+Use `None` to keep backend defaults, `False` to disable certificate checks,
+or pass a CA bundle path or `ssl.SSLContext` where the selected backend
+supports it.
+
 ## License
 
 This project is licensed under the terms of the

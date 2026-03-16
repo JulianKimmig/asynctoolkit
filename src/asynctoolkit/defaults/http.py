@@ -6,6 +6,8 @@ from typing import Any, Optional
 from collections.abc import AsyncIterable, Mapping
 from abc import ABC, abstractmethod
 import json as json_lib
+from pathlib import Path
+import ssl
 from ..base import register_tool, ExtendableTool
 
 
@@ -127,6 +129,7 @@ class MockHTTPRequest:
     stream: bool = False
     files: Optional[dict] = None
     cookies: Optional[dict] = None
+    verify: bool | str | ssl.SSLContext | None = None
     extra: dict[str, Any] = field(default_factory=dict)
 
 
@@ -210,6 +213,7 @@ class HTTPTool(ExtendableTool[AbstractAsyncContextManager[AsyncResponse]]):
         extension=None,
         files: Optional[dict] = None,
         cookies: Optional[dict] = None,
+        verify: bool | str | ssl.SSLContext | None = None,
         request_handler=None,
     ) -> AbstractAsyncContextManager[AsyncResponse]:
         """
@@ -226,6 +230,9 @@ class HTTPTool(ExtendableTool[AbstractAsyncContextManager[AsyncResponse]]):
             stream: Whether to stream the response.
             extension: The extension to use for the HTTP request.
             files: Optional files to send in the request body.
+            verify: TLS verification mode. Use None for backend defaults,
+                bool to enable/disable verification, str for a CA bundle or
+                trust store path, or ssl.SSLContext where supported.
             request_handler: Optional in-memory handler used by the mock extension.
         Returns:
             The result of the HTTP request.
@@ -235,6 +242,8 @@ class HTTPTool(ExtendableTool[AbstractAsyncContextManager[AsyncResponse]]):
             raise ValueError(
                 "data and json parameters can not be used at the same time"
             )
+        if verify is not None and not isinstance(verify, (bool, str, ssl.SSLContext)):
+            raise TypeError("verify must be None, bool, str, or ssl.SSLContext.")
         if request_handler is not None:
             if extension is None:
                 extension = "mock"
@@ -262,6 +271,8 @@ class HTTPTool(ExtendableTool[AbstractAsyncContextManager[AsyncResponse]]):
             request_kwargs["files"] = files
         if cookies is not None:
             request_kwargs["cookies"] = cookies
+        if verify is not None:
+            request_kwargs["verify"] = verify
         if request_handler is not None:
             request_kwargs["request_handler"] = request_handler
 
@@ -280,6 +291,30 @@ register_tool("http", HTTPTool)
 ###############################################################################
 try:
     import aiohttp
+
+    _AIOHTTP_SSL_DEFAULT = object()
+
+    def _coerce_aiohttp_ssl(
+        verify: bool | str | ssl.SSLContext | None,
+    ) -> bool | ssl.SSLContext | object:
+        if verify is None or verify is True:
+            return _AIOHTTP_SSL_DEFAULT
+        if verify is False:
+            return False
+        if isinstance(verify, ssl.SSLContext):
+            return verify
+        if isinstance(verify, str):
+            verify_path = Path(verify)
+            if verify_path.is_file():
+                return ssl.create_default_context(cafile=str(verify_path))
+            if verify_path.is_dir():
+                return ssl.create_default_context(capath=str(verify_path))
+            raise ValueError(
+                "verify for extension='aiohttp' must be an existing file or directory."
+            )
+        raise TypeError(
+            "verify for extension='aiohttp' must be None, bool, str, or ssl.SSLContext."
+        )
 
     class AiohttpResponse(AsyncResponse):
         """
@@ -324,6 +359,7 @@ try:
         stream: bool = False,  # aiohttp does not need stream parameter
         cookies: Optional[dict] = None,
         files: Optional[dict] = None,
+        verify: bool | str | ssl.SSLContext | None = None,
         **kwargs,
     ) -> AbstractAsyncContextManager[AsyncResponse]:
         """
@@ -331,6 +367,7 @@ try:
         """
 
         payload = data
+        ssl_arg = _coerce_aiohttp_ssl(verify)
         if files:
             if data is not None and not isinstance(data, Mapping):
                 raise TypeError(
@@ -375,17 +412,23 @@ try:
             except Exception:
                 inner_timeout = timeout
 
+            request_kwargs = dict(
+                headers=headers,
+                params=params,
+                data=payload,
+                json=json,
+                cookies=cookies,
+                timeout=inner_timeout,
+                **kwargs,
+            )
+            if ssl_arg is not _AIOHTTP_SSL_DEFAULT:
+                request_kwargs["ssl"] = ssl_arg
+
             async with aiohttp.ClientSession() as session:
                 async with session.request(
                     method,
                     url,
-                    headers=headers,
-                    params=params,
-                    data=payload,
-                    json=json,
-                    cookies=cookies,
-                    timeout=inner_timeout,
-                    **kwargs,
+                    **request_kwargs,
                 ) as response:
                     yield AiohttpResponse(response)
 
@@ -448,6 +491,7 @@ try:
         json: Optional[Any] = None,
         timeout: int = 10,
         stream: bool = False,
+        verify: bool | str | ssl.SSLContext | None = None,
         **kwargs,
     ) -> AbstractAsyncContextManager[AsyncResponse]:
         """
@@ -456,7 +500,7 @@ try:
 
         @asynccontextmanager
         async def _request_context():
-            response = requests.request(
+            request_kwargs = dict(
                 method=method,
                 url=url,
                 headers=headers,
@@ -467,6 +511,10 @@ try:
                 stream=stream,
                 **kwargs,
             )
+            if verify is not None:
+                request_kwargs["verify"] = verify
+
+            response = requests.request(**request_kwargs)
             yield RequestsResponse(response)
 
         return _request_context()
@@ -522,6 +570,7 @@ try:
         json: Optional[Any] = None,
         timeout: int = 10,
         stream: bool = False,
+        verify: bool | str | ssl.SSLContext | None = None,
         **kwargs,
     ) -> AbstractAsyncContextManager[HttpxResponse]:
         """
@@ -538,7 +587,11 @@ try:
                 **kwargs,
             )
 
-            async with httpx.AsyncClient(timeout=timeout) as client:
+            client_kwargs = {"timeout": timeout}
+            if verify is not None:
+                client_kwargs["verify"] = verify
+
+            async with httpx.AsyncClient(**client_kwargs) as client:
                 if stream:
                     async with client.stream(method, url, **request_kwargs) as response:
                         yield HttpxResponse(response)
@@ -615,6 +668,7 @@ try:  # pragma: no cover - requires Pyodide runtime
         json: Optional[Any] = None,
         timeout: int = 10,
         stream: bool = False,  # Pyodide fetch does not need stream parameter
+        verify: bool | str | ssl.SSLContext | None = None,
         **kwargs,
     ) -> AbstractAsyncContextManager[AsyncResponse]:
         """
@@ -624,13 +678,19 @@ try:  # pragma: no cover - requires Pyodide runtime
             - If 'params' is provided, they are URL-encoded and appended to the URL.
             - If 'json' is provided, it is serialized to JSON and the appropriate
               Content-Type header is set.
+            - verify only supports None and True. Other values fail explicitly.
         """
+
+        if verify is not None and verify is not True:
+            raise NotImplementedError(
+                "verify is only supported as None or True for extension='pyodide'."
+            )
 
         @asynccontextmanager
         async def _request_context():
-            nonlocal url, headers, params, data, json, timeout, kwargs  # noqa: F824
             # Append query parameters if provided.
             request_url = url
+            request_headers = headers
             if params:
                 scheme, netloc, path, query, fragment = urlsplit(request_url)
                 extra = urlencode(params)
@@ -641,14 +701,14 @@ try:  # pragma: no cover - requires Pyodide runtime
             body = None
             if json is not None:
                 body = json_lib.dumps(json)
-                headers = headers or {}
-                headers.setdefault("Content-Type", "application/json")
+                request_headers = dict(request_headers or {})
+                request_headers.setdefault("Content-Type", "application/json")
             elif data is not None:
                 body = data
 
             response = await pyfetch(
                 request_url,
-                headers=headers,
+                headers=request_headers,
                 method=method,
                 timeout=timeout,
                 body=body,
@@ -674,6 +734,7 @@ async def _register_mock_request(
     stream: bool = False,
     files: Optional[dict] = None,
     cookies: Optional[dict] = None,
+    verify: bool | str | ssl.SSLContext | None = None,
     request_handler=None,
     **kwargs,
 ) -> AbstractAsyncContextManager[AsyncResponse]:
@@ -710,6 +771,7 @@ async def _register_mock_request(
         stream=stream,
         files=files,
         cookies=cookies,
+        verify=verify,
         extra=dict(kwargs),
     )
 
