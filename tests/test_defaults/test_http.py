@@ -1,5 +1,6 @@
 import io
 import json
+import ssl
 import uuid
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -109,6 +110,103 @@ class _DummyAsyncResponse(AsyncResponse):
         if isinstance(self._body, bytes):
             return self._body
         return str(self._body).encode()
+
+
+class _FakeRequestsResponse:
+    def __init__(self, url="http://example", body=b'{"ok": true}'):
+        self.url = url
+        self.text = body.decode("utf-8")
+        self._body = body
+        self.status_code = 200
+        self.headers = {"Content-Type": "application/json"}
+        self.reason = "OK"
+
+    def json(self):
+        return json.loads(self.text)
+
+    def iter_content(self, chunk_size=1024):
+        for idx in range(0, len(self._body), chunk_size):
+            yield self._body[idx : idx + chunk_size]
+
+
+class _FakeHttpxResponse:
+    def __init__(self, url="http://example", body=b'{"ok": true}'):
+        self.url = url
+        self.text = body.decode("utf-8")
+        self._body = body
+        self.status_code = 200
+        self.headers = {"Content-Type": "application/json"}
+        self.reason_phrase = "OK"
+
+    def json(self):
+        return json.loads(self.text)
+
+    async def aiter_bytes(self, chunk_size=1024):
+        for idx in range(0, len(self._body), chunk_size):
+            yield self._body[idx : idx + chunk_size]
+
+    async def aread(self):
+        return self._body
+
+
+class _FakeAiohttpContent:
+    def __init__(self, body: bytes):
+        self._body = body
+
+    async def iter_chunked(self, chunk_size: int):
+        for idx in range(0, len(self._body), chunk_size):
+            yield self._body[idx : idx + chunk_size]
+
+
+class _FakeAiohttpResponse:
+    def __init__(self, url="http://example", body=b'{"ok": true}'):
+        self.url = url
+        self.status = 200
+        self.headers = {"Content-Type": "application/json"}
+        self.reason = "OK"
+        self._body = body
+        self.content = _FakeAiohttpContent(body)
+
+    async def text(self):
+        return self._body.decode("utf-8")
+
+    async def json(self):
+        return json.loads(await self.text())
+
+    async def read(self):
+        return self._body
+
+
+class _FakeAiohttpRequestContext:
+    def __init__(self, response: _FakeAiohttpResponse):
+        self._response = response
+
+    async def __aenter__(self):
+        return self._response
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+
+class _FakeAiohttpClientSession:
+    def __init__(self, calls: list[dict]):
+        self._calls = calls
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    def request(self, method, url, **kwargs):
+        self._calls.append(
+            {
+                "method": method,
+                "url": url,
+                "kwargs": kwargs,
+            }
+        )
+        return _FakeAiohttpRequestContext(_FakeAiohttpResponse(url=url))
 
 
 @pytest.mark.asyncio
@@ -280,6 +378,66 @@ async def test_http_tool_forwards_request_kwargs():
 
 
 @pytest.mark.asyncio
+async def test_http_tool_forwards_verify_request_kwarg():
+    captured = []
+    extension_name = f"_capture_verify_{uuid.uuid4().hex}"
+    ssl_context = ssl.create_default_context()
+
+    async def capture_extension(**kwargs):
+        captured.append(kwargs)
+
+        @asynccontextmanager
+        async def _ctx():
+            yield _DummyAsyncResponse()
+
+        return _ctx()
+
+    HTTPTool.register_extension(extension_name, capture_extension)
+
+    tool = HTTPTool()
+
+    async with await tool.run(
+        "http://example/verify-false",
+        extension=extension_name,
+        verify=False,
+    ):
+        pass
+
+    async with await tool.run(
+        "http://example/verify-path",
+        extension=extension_name,
+        verify="/tmp/internal-ca.pem",
+    ):
+        pass
+
+    async with await tool.run(
+        "http://example/verify-context",
+        extension=extension_name,
+        verify=ssl_context,
+    ):
+        pass
+
+    async with await tool.run(
+        "http://example/verify-default",
+        extension=extension_name,
+    ):
+        pass
+
+    assert captured[0]["verify"] is False
+    assert captured[1]["verify"] == "/tmp/internal-ca.pem"
+    assert captured[2]["verify"] is ssl_context
+    assert "verify" not in captured[3]
+
+
+@pytest.mark.asyncio
+async def test_http_tool_rejects_invalid_verify_type():
+    tool = HTTPTool()
+
+    with pytest.raises(TypeError, match="verify"):
+        await tool.run("http://example/invalid-verify", verify=object())
+
+
+@pytest.mark.asyncio
 async def test_http_mock_extension_uses_request_handler():
     captured = []
     file_obj = io.BytesIO(b"abc")
@@ -355,6 +513,47 @@ async def test_http_mock_request_handler_defaults_to_mock_extension():
 
 
 @pytest.mark.asyncio
+async def test_http_mock_extension_exposes_verify():
+    ssl_context = ssl.create_default_context()
+    seen = []
+
+    def handler(request: MockHTTPRequest) -> MockHTTPResponse:
+        seen.append(request.verify)
+        return MockHTTPResponse(json={"ok": True})
+
+    async with await run_tool(
+        "http",
+        url="http://example/mock-verify-false",
+        method="GET",
+        verify=False,
+        request_handler=handler,
+    ) as response:
+        assert await response.json() == {"ok": True}
+
+    async with await run_tool(
+        "http",
+        url="http://example/mock-verify-path",
+        method="GET",
+        verify="/tmp/internal-ca.pem",
+        request_handler=handler,
+    ) as response:
+        assert await response.json() == {"ok": True}
+
+    async with await run_tool(
+        "http",
+        url="http://example/mock-verify-context",
+        method="GET",
+        verify=ssl_context,
+        request_handler=handler,
+    ) as response:
+        assert await response.json() == {"ok": True}
+
+    assert seen[0] is False
+    assert seen[1] == "/tmp/internal-ca.pem"
+    assert seen[2] is ssl_context
+
+
+@pytest.mark.asyncio
 async def test_http_mock_extension_supports_binary_bodies():
     body = b"streamed-body"
 
@@ -383,6 +582,269 @@ async def test_http_mock_extension_supports_binary_bodies():
             chunks.append(chunk)
 
     assert b"".join(chunks) == body
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not HAS_REQUESTS, reason="requests not available")
+async def test_http_requests_verify_forwarding(monkeypatch):
+    captured = []
+
+    def fake_request(*args, **kwargs):
+        captured.append(kwargs)
+        return _FakeRequestsResponse(url=kwargs["url"])
+
+    monkeypatch.setattr("asynctoolkit.defaults.http.requests.request", fake_request)
+
+    async with await run_tool(
+        "http",
+        url="http://example/requests-false",
+        method="GET",
+        extension="requests",
+        verify=False,
+    ) as response:
+        assert await response.json() == {"ok": True}
+
+    async with await run_tool(
+        "http",
+        url="http://example/requests-path",
+        method="GET",
+        extension="requests",
+        verify="/tmp/internal-ca.pem",
+    ) as response:
+        assert await response.json() == {"ok": True}
+
+    async with await run_tool(
+        "http",
+        url="http://example/requests-default",
+        method="GET",
+        extension="requests",
+    ) as response:
+        assert await response.json() == {"ok": True}
+
+    assert captured[0]["verify"] is False
+    assert captured[1]["verify"] == "/tmp/internal-ca.pem"
+    assert "verify" not in captured[2]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not HAS_HTTPX, reason="httpx not available")
+async def test_http_httpx_verify_forwarding(monkeypatch):
+    client_kwargs = []
+    ssl_context = ssl.create_default_context()
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            client_kwargs.append(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def request(self, method, url, **kwargs):
+            return _FakeHttpxResponse(url=url)
+
+    monkeypatch.setattr("asynctoolkit.defaults.http.httpx.AsyncClient", FakeAsyncClient)
+
+    async with await run_tool(
+        "http",
+        url="http://example/httpx-false",
+        method="GET",
+        extension="httpx",
+        verify=False,
+    ) as response:
+        assert await response.json() == {"ok": True}
+
+    async with await run_tool(
+        "http",
+        url="http://example/httpx-path",
+        method="GET",
+        extension="httpx",
+        verify="/tmp/internal-ca.pem",
+    ) as response:
+        assert await response.json() == {"ok": True}
+
+    async with await run_tool(
+        "http",
+        url="http://example/httpx-context",
+        method="GET",
+        extension="httpx",
+        verify=ssl_context,
+    ) as response:
+        assert await response.json() == {"ok": True}
+
+    async with await run_tool(
+        "http",
+        url="http://example/httpx-default",
+        method="GET",
+        extension="httpx",
+    ) as response:
+        assert await response.json() == {"ok": True}
+
+    assert client_kwargs[0]["verify"] is False
+    assert client_kwargs[1]["verify"] == "/tmp/internal-ca.pem"
+    assert client_kwargs[2]["verify"] is ssl_context
+    assert "verify" not in client_kwargs[3]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not available")
+async def test_http_aiohttp_verify_false_maps_to_ssl_false(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        "asynctoolkit.defaults.http.aiohttp.ClientSession",
+        lambda: _FakeAiohttpClientSession(calls),
+    )
+
+    async with await run_tool(
+        "http",
+        url="http://example/aiohttp-false",
+        method="GET",
+        extension="aiohttp",
+        verify=False,
+    ) as response:
+        assert await response.json() == {"ok": True}
+
+    assert calls[0]["kwargs"]["ssl"] is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not available")
+async def test_http_aiohttp_verify_context_passes_through(monkeypatch):
+    calls = []
+    ssl_context = ssl.create_default_context()
+
+    monkeypatch.setattr(
+        "asynctoolkit.defaults.http.aiohttp.ClientSession",
+        lambda: _FakeAiohttpClientSession(calls),
+    )
+
+    async with await run_tool(
+        "http",
+        url="http://example/aiohttp-context",
+        method="GET",
+        extension="aiohttp",
+        verify=ssl_context,
+    ) as response:
+        assert await response.json() == {"ok": True}
+
+    assert calls[0]["kwargs"]["ssl"] is ssl_context
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not available")
+@pytest.mark.parametrize(
+    ("path_kind", "expected_kwargs"),
+    [
+        ("file", {"cafile": "ca.pem"}),
+        ("dir", {"capath": "ca-dir"}),
+    ],
+)
+async def test_http_aiohttp_verify_path_builds_ssl_context(
+    monkeypatch, tmp_path, path_kind, expected_kwargs
+):
+    calls = []
+    context_calls = []
+    created_context = ssl.create_default_context()
+
+    monkeypatch.setattr(
+        "asynctoolkit.defaults.http.aiohttp.ClientSession",
+        lambda: _FakeAiohttpClientSession(calls),
+    )
+
+    def fake_create_default_context(**kwargs):
+        context_calls.append(kwargs)
+        return created_context
+
+    monkeypatch.setattr(
+        "asynctoolkit.defaults.http.ssl.create_default_context",
+        fake_create_default_context,
+    )
+
+    if path_kind == "file":
+        verify_path = tmp_path / "ca.pem"
+        verify_path.write_text("dummy cert")
+    else:
+        verify_path = tmp_path / "ca-dir"
+        verify_path.mkdir()
+
+    async with await run_tool(
+        "http",
+        url="http://example/aiohttp-path",
+        method="GET",
+        extension="aiohttp",
+        verify=str(verify_path),
+    ) as response:
+        assert await response.json() == {"ok": True}
+
+    expected = {key: str(verify_path) for key in expected_kwargs}
+    assert context_calls == [expected]
+    assert calls[0]["kwargs"]["ssl"] is created_context
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not available")
+async def test_http_aiohttp_verify_invalid_path_raises(monkeypatch, tmp_path):
+    calls = []
+
+    monkeypatch.setattr(
+        "asynctoolkit.defaults.http.aiohttp.ClientSession",
+        lambda: _FakeAiohttpClientSession(calls),
+    )
+
+    with pytest.raises(ValueError, match="verify"):
+        await run_tool(
+            "http",
+            url="http://example/aiohttp-invalid-path",
+            method="GET",
+            extension="aiohttp",
+            verify=str(tmp_path / "missing.pem"),
+        )
+
+    assert calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not available")
+@pytest.mark.parametrize("verify", [None, True])
+async def test_http_aiohttp_verify_default_does_not_override_ssl(monkeypatch, verify):
+    calls = []
+
+    monkeypatch.setattr(
+        "asynctoolkit.defaults.http.aiohttp.ClientSession",
+        lambda: _FakeAiohttpClientSession(calls),
+    )
+
+    kwargs = {
+        "url": "http://example/aiohttp-default",
+        "method": "GET",
+        "extension": "aiohttp",
+    }
+    if verify is not None:
+        kwargs["verify"] = verify
+
+    async with await run_tool("http", **kwargs) as response:
+        assert await response.json() == {"ok": True}
+
+    assert "ssl" not in calls[0]["kwargs"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not HAS_PYODIDE, reason="pyodide not available")
+@pytest.mark.parametrize(
+    "verify", [False, "/tmp/internal-ca.pem", ssl.create_default_context()]
+)
+async def test_http_pyodide_verify_rejects_unsupported_values(verify):
+    with pytest.raises((ValueError, NotImplementedError), match="verify"):
+        await run_tool(
+            "http",
+            url="https://example.invalid",
+            method="GET",
+            extension="pyodide",
+            verify=verify,
+        )
 
 
 @pytest.mark.asyncio
