@@ -1,3 +1,9 @@
+## 0.4.0a0 (2026-03-16)
+
+### Feat
+
+- **http**: add verify support across HTTP backends
+
 ## 0.3.0 (2026-03-16)
 
 ### Feat
