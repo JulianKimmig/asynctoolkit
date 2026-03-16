@@ -1,8 +1,11 @@
 from __future__ import annotations
 from contextlib import asynccontextmanager, AbstractAsyncContextManager
+from dataclasses import dataclass, field
+from inspect import isawaitable
 from typing import Any, Optional
 from collections.abc import AsyncIterable, Mapping
 from abc import ABC, abstractmethod
+import json as json_lib
 from ..base import register_tool, ExtendableTool
 
 
@@ -109,6 +112,85 @@ class AsyncResponse(ABC):
             raise AsyncResponse.HTTPError(http_error_msg, response=self)
 
 
+_MOCK_JSON_UNSET = object()
+
+
+@dataclass(slots=True)
+class MockHTTPRequest:
+    url: str
+    method: str = "GET"
+    headers: Optional[dict] = None
+    params: Optional[dict] = None
+    data: Optional[Any] = None
+    json: Optional[Any] = None
+    timeout: int = 10
+    stream: bool = False
+    files: Optional[dict] = None
+    cookies: Optional[dict] = None
+    extra: dict[str, Any] = field(default_factory=dict)
+
+
+@dataclass(slots=True)
+class MockHTTPResponse:
+    status: int = 200
+    reason: str = "OK"
+    headers: dict[str, Any] = field(default_factory=dict)
+    body: Optional[Any] = b""
+    json: Any = _MOCK_JSON_UNSET
+    url: Optional[str] = None
+
+
+class MockResponse(AsyncResponse):
+    def __init__(self, request: MockHTTPRequest, response: MockHTTPResponse):
+        super().__init__(response.url or request.url, response)
+        self._response = response
+
+    async def text(self) -> str:
+        if self._response.json is not _MOCK_JSON_UNSET:
+            return json_lib.dumps(self._response.json)
+
+        body = self._response.body
+        if body is None:
+            return ""
+        if isinstance(body, bytes):
+            return body.decode("utf-8", errors="ignore")
+        if isinstance(body, bytearray):
+            return bytes(body).decode("utf-8", errors="ignore")
+        return str(body)
+
+    async def json(self) -> Any:
+        if self._response.json is not _MOCK_JSON_UNSET:
+            return self._response.json
+        return json_lib.loads(await self.text())
+
+    async def status(self) -> int:
+        return self._response.status
+
+    async def headers(self) -> dict:
+        return dict(self._response.headers)
+
+    async def reason(self) -> str:
+        return self._response.reason
+
+    async def iter_content(self, chunk_size: int = 1024) -> AsyncIterable[bytes]:
+        payload = await self.content()
+        for idx in range(0, len(payload), chunk_size):
+            yield payload[idx : idx + chunk_size]
+
+    async def content(self) -> bytes:
+        if self._response.json is not _MOCK_JSON_UNSET:
+            return json_lib.dumps(self._response.json).encode("utf-8")
+
+        body = self._response.body
+        if body is None:
+            return b""
+        if isinstance(body, bytes):
+            return body
+        if isinstance(body, bytearray):
+            return bytes(body)
+        return str(body).encode("utf-8")
+
+
 class HTTPTool(ExtendableTool[AbstractAsyncContextManager[AsyncResponse]]):
     """
     Example asynchronous tool for performing HTTP requests.
@@ -128,6 +210,7 @@ class HTTPTool(ExtendableTool[AbstractAsyncContextManager[AsyncResponse]]):
         extension=None,
         files: Optional[dict] = None,
         cookies: Optional[dict] = None,
+        request_handler=None,
     ) -> AbstractAsyncContextManager[AsyncResponse]:
         """
         Execute an HTTP request using a registered backend extension.
@@ -143,6 +226,7 @@ class HTTPTool(ExtendableTool[AbstractAsyncContextManager[AsyncResponse]]):
             stream: Whether to stream the response.
             extension: The extension to use for the HTTP request.
             files: Optional files to send in the request body.
+            request_handler: Optional in-memory handler used by the mock extension.
         Returns:
             The result of the HTTP request.
         """
@@ -151,6 +235,13 @@ class HTTPTool(ExtendableTool[AbstractAsyncContextManager[AsyncResponse]]):
             raise ValueError(
                 "data and json parameters can not be used at the same time"
             )
+        if request_handler is not None:
+            if extension is None:
+                extension = "mock"
+            elif extension != "mock":
+                raise ValueError(
+                    "request_handler can only be used with extension='mock'."
+                )
 
         request_kwargs: dict[str, Any] = {
             "url": url,
@@ -171,6 +262,8 @@ class HTTPTool(ExtendableTool[AbstractAsyncContextManager[AsyncResponse]]):
             request_kwargs["files"] = files
         if cookies is not None:
             request_kwargs["cookies"] = cookies
+        if request_handler is not None:
+            request_kwargs["request_handler"] = request_handler
 
         return await super().run(
             extension=extension,
@@ -247,7 +340,7 @@ try:
             if isinstance(data, Mapping):
                 for key, value in data.items():
                     form.add_field(key, value)
-            for field, file_value in files.items():
+            for form_field, file_value in files.items():
                 form_kwargs = {}
                 file_body = file_value
                 filename = None
@@ -269,7 +362,7 @@ try:
                 if content_type is not None:
                     form_kwargs["content_type"] = content_type
 
-                form.add_field(field, file_body, **form_kwargs)
+                form.add_field(form_field, file_body, **form_kwargs)
 
             payload = form
 
@@ -470,7 +563,6 @@ try:  # pragma: no cover - requires Pyodide runtime
     # In Pyodide environments, pyodide.http provides pyfetch.
     from pyodide.http import pyfetch
     from urllib.parse import urlencode, urlsplit, urlunsplit
-    import json as json_lib
 
     class PyodideResponse(AsyncResponse):
         """
@@ -536,14 +628,14 @@ try:  # pragma: no cover - requires Pyodide runtime
 
         @asynccontextmanager
         async def _request_context():
-            nonlocal url, headers, params, data, json, timeout, kwargs
-
+            nonlocal url, headers, params, data, json, timeout, kwargs  # noqa: F824
             # Append query parameters if provided.
+            request_url = url
             if params:
-                scheme, netloc, path, query, fragment = urlsplit(url)
+                scheme, netloc, path, query, fragment = urlsplit(request_url)
                 extra = urlencode(params)
                 query = f"{query}&{extra}" if query else extra
-                url = urlunsplit((scheme, netloc, path, query, fragment))
+                request_url = urlunsplit((scheme, netloc, path, query, fragment))
 
             # Prepare request body.
             body = None
@@ -555,7 +647,7 @@ try:  # pragma: no cover - requires Pyodide runtime
                 body = data
 
             response = await pyfetch(
-                url,
+                request_url,
                 headers=headers,
                 method=method,
                 timeout=timeout,
@@ -569,3 +661,63 @@ try:  # pragma: no cover - requires Pyodide runtime
     HTTPTool.register_extension("pyodide", _register_pyodide_request)
 except ImportError:  # pragma: no cover - requires Pyodide runtime
     pass
+
+
+async def _register_mock_request(
+    url: str,
+    method: str = "GET",
+    headers: Optional[dict] = None,
+    params: Optional[dict] = None,
+    data: Optional[Any] = None,
+    json: Optional[Any] = None,
+    timeout: int = 10,
+    stream: bool = False,
+    files: Optional[dict] = None,
+    cookies: Optional[dict] = None,
+    request_handler=None,
+    **kwargs,
+) -> AbstractAsyncContextManager[AsyncResponse]:
+    """
+    Perform an HTTP request using an in-memory handler.
+    """
+
+    if request_handler is None:
+        raise ValueError("extension='mock' requires a request_handler.")
+
+    async def _resolve_response(request: MockHTTPRequest) -> AsyncResponse:
+        response = request_handler(request)
+        if isawaitable(response):
+            response = await response
+
+        if isinstance(response, AsyncResponse):
+            return response
+        if isinstance(response, MockHTTPResponse):
+            return MockResponse(request, response)
+        if isinstance(response, Mapping):
+            return MockResponse(request, MockHTTPResponse(**response))
+        raise TypeError(
+            "request_handler must return AsyncResponse, MockHTTPResponse, or a mapping."
+        )
+
+    request = MockHTTPRequest(
+        url=url,
+        method=method,
+        headers=headers,
+        params=params,
+        data=data,
+        json=json,
+        timeout=timeout,
+        stream=stream,
+        files=files,
+        cookies=cookies,
+        extra=dict(kwargs),
+    )
+
+    @asynccontextmanager
+    async def _request_context():
+        yield await _resolve_response(request)
+
+    return _request_context()
+
+
+HTTPTool.register_extension("mock", _register_mock_request)
