@@ -7,31 +7,36 @@ from contextlib import asynccontextmanager
 import pytest
 
 from asynctoolkit.base import run_tool
-from asynctoolkit.defaults.http import AsyncResponse, HTTPTool
+from asynctoolkit.defaults.http import (
+    AsyncResponse,
+    HTTPTool,
+    MockHTTPRequest,
+    MockHTTPResponse,
+)
 
 try:  # Optional backends
-    import aiohttp
+    import aiohttp  # noqa: F401
 
     HAS_AIOHTTP = True
 except ImportError:  # pragma: no cover - best effort environment detection
     HAS_AIOHTTP = False
 
 try:
-    import requests
+    import requests  # noqa: F401
 
     HAS_REQUESTS = True
 except ImportError:  # pragma: no cover
     HAS_REQUESTS = False
 
 try:
-    import httpx
+    import httpx  # noqa: F401
 
     HAS_HTTPX = True
 except ImportError:  # pragma: no cover
     HAS_HTTPX = False
 
 try:
-    import pyodide
+    import pyodide  # noqa: F401
 
     HAS_PYODIDE = True
 except ImportError:  # pragma: no cover
@@ -53,7 +58,9 @@ def _extensions():
     ]
 
 
-def _schedule_json(httpserver, path, payload, *, status=200, method="GET", headers=None):
+def _schedule_json(
+    httpserver, path, payload, *, status=200, method="GET", headers=None
+):
     httpserver.expect_request(path, method=method).respond_with_json(
         payload, headers=headers or {}, status=status
     )
@@ -273,6 +280,112 @@ async def test_http_tool_forwards_request_kwargs():
 
 
 @pytest.mark.asyncio
+async def test_http_mock_extension_uses_request_handler():
+    captured = []
+    file_obj = io.BytesIO(b"abc")
+
+    async def handler(request: MockHTTPRequest) -> MockHTTPResponse:
+        captured.append(request)
+        assert request.url == "http://example/mock"
+        assert request.method == "POST"
+        assert request.headers == {"X-Test": "1"}
+        assert request.params == {"page": "2"}
+        assert request.data == b"payload"
+        assert request.json is None
+        assert request.timeout == 7
+        assert request.stream is True
+        assert request.files == {"upload": ("sample.txt", file_obj)}
+        assert request.cookies == {"session": "cookie"}
+        return MockHTTPResponse(
+            status=201,
+            reason="Created",
+            headers={"X-Mocked": "yes"},
+            json={"ok": True},
+        )
+
+    async with await run_tool(
+        "http",
+        url="http://example/mock",
+        method="POST",
+        headers={"X-Test": "1"},
+        params={"page": "2"},
+        data=b"payload",
+        timeout=7,
+        stream=True,
+        files={"upload": ("sample.txt", file_obj)},
+        cookies={"session": "cookie"},
+        extension="mock",
+        request_handler=handler,
+    ) as response:
+        assert await response.status() == 201
+        assert await response.reason() == "Created"
+        assert await response.headers() == {"X-Mocked": "yes"}
+        assert await response.json() == {"ok": True}
+        assert await response.text() == '{"ok": true}'
+
+    assert len(captured) == 1
+
+
+@pytest.mark.asyncio
+async def test_http_mock_extension_requires_request_handler():
+    tool = HTTPTool()
+
+    with pytest.raises(ValueError, match="request_handler"):
+        await tool.run("http://example/mock", extension="mock")
+
+
+@pytest.mark.asyncio
+async def test_http_mock_request_handler_defaults_to_mock_extension():
+    seen = []
+
+    def handler(request: MockHTTPRequest) -> MockHTTPResponse:
+        seen.append(request)
+        assert request.extra == {}
+        return MockHTTPResponse(json={"ok": True})
+
+    async with await run_tool(
+        "http",
+        url="http://example/default-mock",
+        method="GET",
+        request_handler=handler,
+    ) as response:
+        assert await response.json() == {"ok": True}
+
+    assert len(seen) == 1
+
+
+@pytest.mark.asyncio
+async def test_http_mock_extension_supports_binary_bodies():
+    body = b"streamed-body"
+
+    def handler(request: MockHTTPRequest) -> MockHTTPResponse:
+        assert request.method == "GET"
+        return MockHTTPResponse(
+            status=202,
+            reason="Accepted",
+            headers={"Content-Type": "application/octet-stream"},
+            body=body,
+        )
+
+    async with await run_tool(
+        "http",
+        url="http://example/binary",
+        method="GET",
+        extension="mock",
+        request_handler=handler,
+        stream=True,
+    ) as response:
+        assert await response.content() == body
+
+        chunks = []
+        async for chunk in response.iter_content(4):
+            assert len(chunk) <= 4
+            chunks.append(chunk)
+
+    assert b"".join(chunks) == body
+
+
+@pytest.mark.asyncio
 @pytest.mark.skipif(not HAS_AIOHTTP, reason="aiohttp not available")
 async def test_http_aiohttp_files_and_validation(httpserver, tmp_path):
     file_path = tmp_path / "sample.txt"
@@ -374,8 +487,6 @@ if HAS_PYODIDE_TEST:
     )
     @run_in_pyodide
     async def test_http_tool_extension_pyodide(selenium):
-        import os
-
         from asynctoolkit.base import run_tool
 
         TEST_URL = "https://httpbin.org/get"
@@ -400,8 +511,6 @@ if HAS_PYODIDE_TEST:
     )
     @run_in_pyodide
     async def test_http_raise_for_pyodide(selenium):
-        import os
-
         from asynctoolkit.base import run_tool
         from asynctoolkit.defaults.http import AsyncResponse
 
@@ -426,8 +535,6 @@ if HAS_PYODIDE_TEST:
     )
     @run_in_pyodide
     async def test_http_iter_content_pyodide(selenium):
-        import os
-
         from asynctoolkit.base import run_tool
 
         TEST_URL = "https://httpbin.org/get"
